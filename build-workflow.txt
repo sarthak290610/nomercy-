@@ -1,0 +1,699 @@
+name: Build NoMercy APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Write project files
+        run: |
+          mkdir -p app app/src/main app/src/main/java/com/nomercy/lock app/src/main/res/values app/src/main/res/xml
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "NoMercy"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.nomercy.lock"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.nomercy.lock"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildFeatures {
+                  buildConfig = true
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@android:drawable/ic_lock_lock"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".BlockActivity"
+                      android:exported="false"
+                      android:excludeFromRecents="true"
+                      android:launchMode="singleTask"
+                      android:taskAffinity="" />
+
+                  <service
+                      android:name=".BlockerService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+
+                  <receiver
+                      android:name=".AdminReceiver"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_DEVICE_ADMIN">
+                      <meta-data
+                          android:name="android.app.device_admin"
+                          android:resource="@xml/device_admin" />
+                      <intent-filter>
+                          <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">NoMercy</string>
+              <string name="a11y_desc">Detects when a blocked app opens and sends you back to the home screen until your lock period ends.</string>
+          </resources>
+          EOF
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/a11y_desc"
+              android:notificationTimeout="100" />
+          EOF
+          cat > app/src/main/res/xml/device_admin.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-policies />
+          </device-admin>
+          EOF
+          cat > app/src/main/java/com/nomercy/lock/LockStore.kt <<'EOF'
+          package com.nomercy.lock
+
+          import android.content.Context
+          import android.os.SystemClock
+          import android.provider.Settings
+
+          /**
+           * Stores the lock and keeps a clock that is hard to cheat.
+           *
+           * Within one boot, time is measured with elapsedRealtime, so changing the
+           * phone's date has no effect. After a reboot we fall back to the wall clock,
+           * but never let it go earlier than the last checkpoint we saw (rollback protection).
+           */
+          object LockStore {
+              const val DAY_MS = 24L * 60 * 60 * 1000
+              private const val PREFS = "lock"
+
+              private fun prefs(c: Context) =
+                  c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+              @Synchronized
+              fun trustedNow(c: Context): Long {
+                  val p = prefs(c)
+                  val wall = System.currentTimeMillis()
+                  val el = SystemClock.elapsedRealtime()
+                  val boot = Settings.Global.getInt(c.contentResolver, Settings.Global.BOOT_COUNT, -1)
+                  val savedWall = p.getLong("cp_wall", 0L)
+                  val savedEl = p.getLong("cp_el", -1L)
+                  val savedBoot = p.getInt("cp_boot", -2)
+
+                  val effective = when {
+                      savedWall == 0L -> wall
+                      savedBoot == boot && savedEl in 0..el -> savedWall + (el - savedEl)
+                      else -> maxOf(wall, savedWall)
+                  }
+
+                  if (savedWall == 0L || savedBoot != boot || effective - savedWall > 60_000) {
+                      p.edit()
+                          .putLong("cp_wall", effective)
+                          .putLong("cp_el", el)
+                          .putInt("cp_boot", boot)
+                          .apply()
+                  }
+                  return effective
+              }
+
+              fun endAt(c: Context): Long = prefs(c).getLong("end", 0L)
+
+              fun isLocked(c: Context): Boolean {
+                  val end = endAt(c)
+                  return end > 0L && trustedNow(c) < end
+              }
+
+              fun remainingMs(c: Context): Long = maxOf(0L, endAt(c) - trustedNow(c))
+
+              fun blocked(c: Context): Set<String> =
+                  prefs(c).getStringSet("pkgs", emptySet()) ?: emptySet()
+
+              /** Returns false (and changes nothing) if a lock is already running. */
+              fun start(c: Context, packages: Set<String>, durationMs: Long): Boolean {
+                  if (isLocked(c) || packages.isEmpty()) return false
+                  val now = trustedNow(c)
+                  return prefs(c).edit()
+                      .putLong("start", now)
+                      .putLong("end", now + durationMs)
+                      .putStringSet("pkgs", HashSet(packages))
+                      .commit()
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/nomercy/lock/AdminReceiver.kt <<'EOF'
+          package com.nomercy.lock
+
+          import android.app.admin.DeviceAdminReceiver
+          import android.content.Context
+          import android.content.Intent
+
+          /** Being an active device admin stops the app from being uninstalled. */
+          class AdminReceiver : DeviceAdminReceiver() {
+              override fun onDisableRequested(context: Context, intent: Intent): CharSequence =
+                  if (LockStore.isLocked(context)) "Locked. You cannot do this right now." else "Protection will be turned off."
+          }
+          EOF
+          cat > app/src/main/java/com/nomercy/lock/BlockerService.kt <<'EOF'
+          package com.nomercy.lock
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.view.accessibility.AccessibilityEvent
+
+          class BlockerService : AccessibilityService() {
+
+              private val handler = Handler(Looper.getMainLooper())
+              private var lastKick = 0L
+              private var lastScan = 0L
+
+              private val heartbeat = object : Runnable {
+                  override fun run() {
+                      LockStore.trustedNow(this@BlockerService) // keeps the clock checkpoint fresh
+                      handler.postDelayed(this, 10 * 60 * 1000L)
+                  }
+              }
+
+              // Settings screens that could be used to escape the lock (matched on the screen title).
+              private val dangerousTitles = listOf(
+                  "accessibility", "device admin", "device administrator",
+                  "date & time", "date and time", "date, time",
+                  "developer options", "reset options", "erase all data", "factory reset"
+              )
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  handler.post(heartbeat)
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacks(heartbeat)
+                  super.onDestroy()
+              }
+
+              override fun onInterrupt() {}
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+                  e ?: return
+                  val pkg = e.packageName?.toString() ?: return
+                  if (pkg == packageName) return
+                  if (e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+                      e.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+                  ) return
+                  if (!LockStore.isLocked(this)) return
+
+                  if (pkg in LockStore.blocked(this)) {
+                      kick()
+                      return
+                  }
+                  if (isGuarded(pkg) && isEscapeScreen(e)) kick()
+              }
+
+              private fun isGuarded(pkg: String) = listOf(
+                  "settings", "packageinstaller", "securitycenter", "permissioncontroller", "systemmanager"
+              ).any { pkg.contains(it) }
+
+              private fun isEscapeScreen(e: AccessibilityEvent): Boolean {
+                  val title = e.text.joinToString(" ").lowercase()
+                  if (dangerousTitles.any { title.contains(it) }) return true
+
+                  // Any screen that shows this app's own name (app info, uninstall, force stop, clear data...).
+                  val now = SystemClock.elapsedRealtime()
+                  if (now - lastScan < 400) return false
+                  lastScan = now
+                  val root = rootInActiveWindow ?: return false
+                  return try {
+                      root.findAccessibilityNodeInfosByText(getString(R.string.app_name)).isNotEmpty()
+                  } catch (t: Throwable) {
+                      false
+                  }
+              }
+
+              private fun kick() {
+                  val now = SystemClock.elapsedRealtime()
+                  if (now - lastKick < 700) return
+                  lastKick = now
+                  performGlobalAction(GLOBAL_ACTION_HOME)
+                  startActivity(
+                      Intent(this, BlockActivity::class.java)
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                  )
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/nomercy/lock/BlockActivity.kt <<'EOF'
+          package com.nomercy.lock
+
+          import android.app.Activity
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          /** Brief "blocked" screen shown after the user is sent home. */
+          class BlockActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val days = LockStore.remainingMs(this) / LockStore.DAY_MS
+                  val left = if (days >= 1) "$days days left" else "less than a day left"
+
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(Color.parseColor("#111111"))
+                      setPadding(64, 64, 64, 64)
+                  }
+                  box.addView(TextView(this).apply {
+                      text = "BLOCKED"
+                      textSize = 36f
+                      setTextColor(Color.parseColor("#E53935"))
+                      gravity = Gravity.CENTER
+                  })
+                  box.addView(TextView(this).apply {
+                      text = "You locked this one. $left.\nNo exceptions."
+                      textSize = 18f
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      setPadding(0, 32, 0, 0)
+                  })
+                  setContentView(box)
+
+                  Handler(Looper.getMainLooper()).postDelayed({ finish() }, 2500)
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/nomercy/lock/MainActivity.kt <<'EOF'
+          package com.nomercy.lock
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.app.admin.DevicePolicyManager
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.provider.Telephony
+          import android.telecom.TelecomManager
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.RadioButton
+          import android.widget.RadioGroup
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              private val BG = Color.parseColor("#111111")
+              private val FG = Color.WHITE
+              private val MUTED = Color.parseColor("#9E9E9E")
+              private val RED = Color.parseColor("#E53935")
+              private val GREEN = Color.parseColor("#43A047")
+
+              private val handler = Handler(Looper.getMainLooper())
+              private val selected = linkedSetOf<String>()
+              private var durationMs = 30 * LockStore.DAY_MS
+              private var countdown: TextView? = null
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      updateCountdown()
+                      handler.postDelayed(this, 1000)
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.statusBarColor = BG
+                  window.navigationBarColor = BG
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  render()
+                  handler.post(tick)
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  handler.removeCallbacks(tick)
+              }
+
+              // ---------- helpers ----------
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun tv(text: String, size: Float, color: Int, bold: Boolean = false) = TextView(this).apply {
+                  this.text = text
+                  textSize = size
+                  setTextColor(color)
+                  if (bold) setTypeface(typeface, Typeface.BOLD)
+                  setPadding(0, dp(4), 0, dp(4))
+              }
+
+              private fun newRoot(): LinearLayout {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(40), dp(20), dp(40))
+                  }
+                  setContentView(ScrollView(this).apply {
+                      setBackgroundColor(BG)
+                      addView(root)
+                  })
+                  return root
+              }
+
+              private fun section(root: LinearLayout, title: String) {
+                  root.addView(tv(title, 18f, FG, true).apply { setPadding(0, dp(24), 0, dp(8)) })
+              }
+
+              private fun isAccessibilityOn(): Boolean {
+                  val me = ComponentName(this, BlockerService::class.java)
+                  val enabled = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+                      ?: return false
+                  return enabled.split(':').any { ComponentName.unflattenFromString(it) == me }
+              }
+
+              private fun adminComponent() = ComponentName(this, AdminReceiver::class.java)
+
+              private fun isAdminOn(): Boolean =
+                  (getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager).isAdminActive(adminComponent())
+
+              private fun labelOf(pkg: String): String = try {
+                  packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+              } catch (e: Exception) {
+                  pkg
+              }
+
+              // ---------- screens ----------
+
+              private fun render() {
+                  countdown = null
+                  if (LockStore.isLocked(this)) renderLocked() else renderSetup()
+              }
+
+              private fun renderLocked() {
+                  val root = newRoot()
+                  root.addView(tv("LOCKED", 34f, RED, true))
+                  root.addView(tv("Time remaining", 14f, MUTED).apply { setPadding(0, dp(24), 0, 0) })
+                  countdown = tv("", 30f, FG, true)
+                  root.addView(countdown)
+                  updateCountdown()
+
+                  root.addView(tv("There is no cancel button. That is the point.", 15f, MUTED).apply {
+                      setPadding(0, dp(16), 0, 0)
+                  })
+
+                  section(root, "Blocked apps")
+                  LockStore.blocked(this).map { labelOf(it) }.sorted().forEach {
+                      root.addView(tv("•  $it", 16f, FG))
+                  }
+
+                  if (!isAccessibilityOn()) {
+                      root.addView(tv("Blocker service is OFF, so blocking is not enforced right now.", 14f, RED).apply {
+                          setPadding(0, dp(24), 0, 0)
+                      })
+                  }
+              }
+
+              private fun updateCountdown() {
+                  val tvw = countdown ?: return
+                  if (!LockStore.isLocked(this)) {
+                      render()
+                      return
+                  }
+                  var s = LockStore.remainingMs(this) / 1000
+                  val d = s / 86400; s %= 86400
+                  val h = s / 3600; s %= 3600
+                  val m = s / 60; s %= 60
+                  tvw.text = String.format("%d d  %02d h  %02d m  %02d s", d, h, m, s)
+              }
+
+              private fun renderSetup() {
+                  val root = newRoot()
+                  root.addView(tv("NoMercy", 34f, FG, true))
+                  root.addView(tv(
+                      "Pick apps and a duration. Once you press the final button there is no password, " +
+                          "no emergency exit and no cancel. Phone, messages and Settings stay usable.",
+                      15f, MUTED
+                  ))
+
+                  // 1. protection
+                  section(root, "1. Protection")
+                  root.addView(statusButton("Accessibility blocker", isAccessibilityOn()) {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  })
+                  root.addView(statusButton("Anti-uninstall (device admin)", isAdminOn()) {
+                      startActivity(
+                          Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
+                              .putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComponent())
+                              .putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "Prevents NoMercy from being uninstalled during a lock.")
+                      )
+                  })
+
+                  // 2. duration
+                  section(root, "2. Duration")
+                  val options = mutableListOf("30 days" to 30 * LockStore.DAY_MS, "60 days" to 60 * LockStore.DAY_MS)
+                  if (BuildConfig.DEBUG) options.add(0, "5 minutes (test build only)" to 5 * 60 * 1000L)
+                  val group = RadioGroup(this)
+                  options.forEachIndexed { i, (label, ms) ->
+                      group.addView(RadioButton(this).apply {
+                          id = View.generateViewId()
+                          text = label
+                          setTextColor(FG)
+                          isChecked = ms == durationMs
+                          setOnClickListener { durationMs = ms }
+                      })
+                  }
+                  if (options.none { it.second == durationMs }) durationMs = options.last { it.second == 30 * LockStore.DAY_MS }.second
+                  root.addView(group)
+
+                  // 3. apps
+                  section(root, "3. Apps to block")
+                  val skip = essentials()
+                  val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val apps = packageManager.queryIntentActivities(launcher, 0)
+                      .map { it.activityInfo.packageName to it }
+                      .distinctBy { it.first }
+                      .filter { it.first !in skip && !isEssentialName(it.first) }
+                      .sortedBy { it.second.loadLabel(packageManager).toString().lowercase() }
+
+                  for ((pkg, info) in apps) {
+                      val row = LinearLayout(this).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                          setPadding(0, dp(4), 0, dp(4))
+                      }
+                      row.addView(ImageView(this).apply {
+                          setImageDrawable(info.loadIcon(packageManager))
+                          layoutParams = LinearLayout.LayoutParams(dp(36), dp(36)).apply { rightMargin = dp(12) }
+                      })
+                      row.addView(CheckBox(this).apply {
+                          text = info.loadLabel(packageManager)
+                          setTextColor(FG)
+                          isChecked = pkg in selected
+                          setOnCheckedChangeListener { _, on -> if (on) selected.add(pkg) else selected.remove(pkg) }
+                      })
+                      root.addView(row)
+                  }
+
+                  // 4. confirm
+                  section(root, "4. Confirm")
+                  val input = EditText(this).apply {
+                      hint = "Type LOCK ME"
+                      setHintTextColor(MUTED)
+                      setTextColor(FG)
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+                  }
+                  root.addView(input)
+                  root.addView(Button(this).apply {
+                      text = "START LOCK"
+                      setBackgroundColor(RED)
+                      setTextColor(FG)
+                      setOnClickListener {
+                          when {
+                              !isAccessibilityOn() || !isAdminOn() -> toast("Turn on both protections in step 1 first.")
+                              selected.isEmpty() -> toast("Select at least one app.")
+                              input.text.toString().trim() != "LOCK ME" -> toast("Type LOCK ME exactly.")
+                              else -> confirmAndStart()
+                          }
+                      }
+                  })
+              }
+
+              private fun statusButton(label: String, on: Boolean, action: () -> Unit) = Button(this).apply {
+                  text = if (on) "$label: ON" else "$label: OFF, tap to enable"
+                  setTextColor(FG)
+                  setBackgroundColor(if (on) GREEN else Color.parseColor("#424242"))
+                  setOnClickListener { action() }
+              }
+
+              private fun confirmAndStart() {
+                  val days = durationMs / LockStore.DAY_MS
+                  val span = if (days >= 1) "$days days" else "${durationMs / 60000} minutes"
+                  AlertDialog.Builder(this)
+                      .setTitle("Last chance")
+                      .setMessage("For $span, these ${selected.size} apps will be unreachable on this phone. This cannot be undone or shortened.")
+                      .setNegativeButton("Go back", null)
+                      .setPositiveButton("Lock them") { _, _ ->
+                          LockStore.start(this, selected, durationMs)
+                          render()
+                      }
+                      .show()
+              }
+
+              private fun toast(msg: String) = android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
+
+              // Apps that must never be blockable: phone, SMS, launcher, system UI, Settings.
+              private fun essentials(): Set<String> {
+                  val s = mutableSetOf(packageName, "com.android.systemui")
+                  try {
+                      (getSystemService(Context.TELECOM_SERVICE) as? TelecomManager)?.defaultDialerPackage?.let { s += it }
+                  } catch (_: Exception) {}
+                  try {
+                      Telephony.Sms.getDefaultSmsPackage(this)?.let { s += it }
+                  } catch (_: Exception) {}
+                  packageManager.resolveActivity(
+                      Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), 0
+                  )?.activityInfo?.packageName?.let { s += it }
+                  return s
+              }
+
+              private fun isEssentialName(p: String) = listOf(
+                  "settings", "dialer", "contacts", "emergency", "packageinstaller",
+                  "permissioncontroller", "incallui", "telecom"
+              ).any { p.contains(it) }
+          }
+          EOF
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NoMercy-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish APK as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk NoMercy.apk
+          gh release delete latest -y --cleanup-tag || true
+          gh release create latest NoMercy.apk --title "NoMercy APK" --notes "Download NoMercy.apk and install it."
